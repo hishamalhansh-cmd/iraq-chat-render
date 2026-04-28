@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash
+from flask import Flask, request, redirect, url_for, session, render_template_string, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 import sqlite3
@@ -788,7 +788,36 @@ def room_chat(room_id):
       <div class="chat-layout">
         <div class="card">
           <div class="section-head"><div><h3>{esc(room['name'])}</h3><p>محافظة {esc(PROVINCE_MAP.get(room['province_slug'], room['province_slug']))} • الموجودين {len(members)}/{ROOM_CAPACITY}</p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><a class="btn-light" href="{url_for('province_rooms', province_slug=room['province_slug'])}"><i class="ri-arrow-right-line"></i> رجوع</a>{'<form method="post" action="'+url_for('clear_room', room_id=room_id)+'"><button class="btn-warning" type="submit"><i class="ri-brush-line"></i> إفراغ الغرفة</button></form>' if has_perm(user, 'clear_rooms') else ''}<a class="btn-danger" href="{url_for('leave_room', room_id=room_id)}"><i class="ri-logout-circle-line"></i> مغادرة</a></div></div>
-          <div class="chat-box">{''.join(msg_html) if msg_html else '<div class="empty">لا توجد رسائل بعد داخل هذه الغرفة.</div>'}</div>
+          <div class="chat-box" id="messages-box" data-room-id="{room_id}">{''.join(msg_html) if msg_html else '<div class="empty">لا توجد رسائل بعد داخل هذه الغرفة.</div>'}</div>
+          <script>
+          (function() {{
+            const box = document.getElementById('messages-box');
+            if (!box) return;
+            let lastHtml = box.innerHTML;
+            let userScrolling = false;
+            function isNearBottom() {{
+              return box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+            }}
+            box.addEventListener('scroll', function() {{
+              userScrolling = !isNearBottom();
+            }});
+            async function refreshMessages() {{
+              try {{
+                const res = await fetch('/rooms/{room_id}/messages-fragment', {{cache: 'no-store'}});
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.html && data.html !== lastHtml) {{
+                  const keepBottom = isNearBottom() && !userScrolling;
+                  box.innerHTML = data.html;
+                  lastHtml = data.html;
+                  if (keepBottom) box.scrollTop = box.scrollHeight;
+                }}
+              }} catch (e) {{}}
+            }}
+            box.scrollTop = box.scrollHeight;
+            setInterval(refreshMessages, 1000);
+          }})();
+          </script>
           <form method="post" style="margin-top:14px">
             <div class="field"><label>رسالتك</label><textarea name="text" rows="4" placeholder="اكتب رسالتك هنا..."></textarea></div>
             <button type="submit"><i class="ri-send-plane-fill"></i> إرسال</button>
@@ -798,6 +827,41 @@ def room_chat(room_id):
       </div>
     '''
     return render_page(room['name'], content, subtitle='شات غرفة فرعية', active='provinces')
+
+
+@app.route('/rooms/<int:room_id>/messages-fragment')
+def room_messages_fragment(room_id):
+    user, resp = require_entry()
+    if resp:
+        return jsonify({'html': ''}), 401
+    conn = db()
+    room = conn.execute('SELECT * FROM subrooms WHERE id=?', (room_id,)).fetchone()
+    if not room:
+        conn.close()
+        return jsonify({'html': '<div class="empty">الغرفة غير موجودة.</div>'}), 404
+    member = conn.execute('SELECT * FROM room_members WHERE room_id=? AND session_id=?', (room_id, user['sid'])).fetchone()
+    if not member and user['role'] != 'owner':
+        conn.close()
+        return jsonify({'html': '<div class="empty">يجب دخول الغرفة أولاً.</div>'}), 403
+    msgs = conn.execute('SELECT * FROM room_messages WHERE room_id=? ORDER BY id ASC', (room_id,)).fetchall()
+    conn.close()
+    msg_html = []
+    for m in msgs:
+        mine = m['session_id'] == user['sid']
+        delete_msg = ''
+        if has_perm(user, 'delete_messages'):
+            delete_msg = '<form method="post" action="{}" style="margin-top:8px"><button class="btn-danger" type="submit"><i class="ri-delete-bin-line"></i> حذف الرسالة</button></form>'.format(url_for('delete_message', message_id=m['id']))
+        role_badge = 'مشرف أساسي' if m['role'] == 'owner' else ('مشرف' if m['role'] == 'admin' else 'زائر')
+        role_name_class = 'role-name-owner' if m['role'] == 'owner' else ('role-name-admin' if m['role'] == 'admin' else 'role-name-visitor')
+        badge_class = 'badge-owner' if m['role'] == 'owner' else ('badge-admin' if m['role'] == 'admin' else '')
+        msg_html.append(f"""
+          <div class="msg {'me' if mine else 'other'}"><div class="bubble">
+            <div style="font-weight:900;margin-bottom:4px"><span class="{role_name_class}">{esc(m['display_name'])}</span> <span class="badge {badge_class}">{role_badge}</span></div>
+            <div>{esc(m['text'])}</div><div class="meta">{esc(m['created_at']).replace('T',' ')[:16]}</div>{delete_msg}
+          </div></div>
+        """)
+    html_content = ''.join(msg_html) if msg_html else '<div class="empty">لا توجد رسائل بعد داخل هذه الغرفة.</div>'
+    return jsonify({'html': html_content})
 
 
 @app.route('/rooms/<int:room_id>/leave')
@@ -1367,10 +1431,9 @@ def logout():
     return redirect(url_for('provinces'))
 
 
-# تهيئة قاعدة البيانات عند تشغيل التطبيق محليًا أو على Render/Gunicorn
+# تهيئة قاعدة البيانات عند تشغيل Render عبر gunicorn app:app
 init_db()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    app.run(host='0.0.0.0', port=port, debug=True)
